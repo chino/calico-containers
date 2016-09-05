@@ -1,5 +1,6 @@
 # -*- mode: ruby -*-
-# # vi: set ft=ruby :
+# # vi: set ft=ruby ts=2 sw=2 et :
+# rubocop:disable all
 
 # To skip Docker pre-load of calico/node and busybox, run vagrant up with:
 #    vagrant up --provision-with file,shell
