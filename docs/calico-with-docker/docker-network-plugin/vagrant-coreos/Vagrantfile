@@ -43,30 +43,165 @@ Vagrant.configure("2") do |config|
     config.vbguest.auto_update = false
   end
 
+  # Not to collide with vbox host
+  offset=100
+
+  # This is what your network admins gave you off your SVI
+  # We'll split compute nodes and pools off into /24's so it's easy to read
+  # The SVI thinks a /16 is off it's interface while we configure nodes/workloads for /24's
+  net = "172.17"
+  net_mask = "16"
+  net_gw = "#{net}.0.#{offset}"
+  compute_node_subnet = "#{net}.0"
+  workload_net_mask = "24"
+
+  # These nets will require that calico nat/ipip or stay private
+  private_net="20.0" # 10.* is used by vbox eth0 management interface
+
+  networks = {
+    # the public network will use the same /16 as the SVI / compute nodes
+    # hence the SVI will try to ARP these
+    # proxy arp on the SVI facing interface will answer these requests
+    # packets will then be routed to the workloads
+    public:       "#{net}.1.0/#{workload_net_mask}",
+
+    # these networks use all local addresses that the SVI wont be able to route
+    private_nat:  "#{private_net}.2.0/#{workload_net_mask}",
+    private_ipip: "#{private_net}.3.0/#{workload_net_mask}",
+    private_only: "#{private_net}.4.0/#{workload_net_mask}",
+  }
+
+  # The router will simply live on our host-only network and act as our default gateway
+  # This makes things look more like a normal setup instead of vagrant like
+  # We rewrite the calico nodes default gateway to be this host
+  config.vm.define "router" do |host|
+    host.vm.hostname = "router"
+    host.vm.network :private_network, ip: net_gw, netmask: "255.255.0.0" #net_mask
+    host.vm.provision :shell, privileged: true, inline: "
+      echo 1 > /proc/sys/net/ipv4/ip_forward
+      iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE
+    "
+  end
+
   # Set up each box
   (1..num_instances).each do |i|
     vm_name = "%s-%02d" % [instance_name_prefix, i]
     config.vm.define vm_name do |host|
       host.vm.hostname = vm_name
 
-      ip = "172.17.8.#{i+100}"
-      host.vm.network :private_network, ip: ip
+      ip = "#{compute_node_subnet}.#{offset + i}"
+      host.vm.network :private_network, ip: ip, netmask: "255.255.255.0" #workload_net_mask
+
+      # docker.io/calico is throwing 404's now?
 
       # Pre-load the calico/node image.  This slows down the vagrant up
       # command, but speeds up the actual tutorial.
-      host.vm.provision :docker, images: ["calico/node-libnetwork:#{calico_libnetwork_ver}", "calico/node:#{calico_node_ver}", "busybox:latest"]
+      #host.vm.provision :docker, images: [
+      #  "calico/node-libnetwork:#{calico_libnetwork_ver}",
+      #  "calico/node:#{calico_node_ver}",
+      #  "busybox:latest"
+      #]
 
       # Use a different cloud-init on the first server.
       if i == 1
-        host.vm.provision :file, :source => "../cloud-config/user-data-first", :destination => "/tmp/vagrantfile-user-data"
-        host.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+        host.vm.provision :file,
+          :source => "../cloud-config/user-data-first",
+          :destination => "/tmp/vagrantfile-user-data"
+        host.vm.provision :shell,
+          :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/",
+          :privileged => true
       else
-        host.vm.provision :file, :source => "../cloud-config/user-data-others", :destination => "/tmp/vagrantfile-user-data"
-        host.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+        host.vm.provision :file,
+          :source => "../cloud-config/user-data-others",
+          :destination => "/tmp/vagrantfile-user-data"
+        host.vm.provision :shell,
+          :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/",
+          :privileged => true
       end
 
-      config.vm.post_up_message = "Vagrant has finished but cloud-init might still be executing.
-      Check the progress using systemctl status -f"
+      host.vm.provision :shell, privileged: true, inline: [
+
+        # setup calico on each host and point at our router
+        "
+          set -ex
+
+          # allow SVI to arp for our workloads
+          echo 1 > /proc/sys/net/ipv4/conf/eth1/proxy_arp
+
+          # TODO: can't we just use 0.0.0.0 ?
+          if [[ $HOSTNAME == calico-02 ]]; then
+            while sleep 1; do
+              [[ -f /home/core/.bashrc ]] && break
+            done
+            while sleep 1; do
+              . /home/core/.bashrc
+              [[ $ETCD_AUTHORITY ]] &&
+              ping -w 2 -c 1 ${ETCD_AUTHORITY/:*} && break
+            done
+          fi
+
+          # wait for boot
+          while sleep 1; do [[ -e $(which calicoctl) ]] && break; done
+
+          # setup calico
+          calicoctl node --libnetwork
+
+          # point default route at the router vm
+          ip route del default
+          ip route add default via #{net_gw} dev eth1
+          ip route
+          ip route get 8.8.8.8
+          ping -c 1 8.8.8.8
+        ",
+
+        # create calico pools and networks
+        networks.map{ |name,net|
+          "
+            if [[ $HOSTNAME == calico-01 ]]; then
+              calicoctl pool add #{net} #{
+                case name
+                when :private_ipip; '--ipip --nat-outgoing'
+                when :private_nat;  '--nat-outgoing'
+                end
+              }
+              docker network create \
+                --driver calico --ipam-driver calico \
+                --subnet #{net} \
+                #{name}
+            fi
+          "
+        },
+
+        # need to wait after creating networks?
+        "sleep 3",
+
+        # create test containers and confirm pings
+        networks.map{ |name,net|
+          can_route = name != :private_only
+          should_fail = "&& exit 1 || true" unless can_route
+          attempts = can_route ? 10 : 1
+          "
+            container=#{name}-${HOSTNAME/*-}
+            docker run --net #{name} --name $container -tid busybox
+
+            # TODO - why do I need this?
+            function retry
+            {
+              local i count=$1; shift
+              for ((i=0; i<$count; i++)); do
+                \"$@\" && return $?
+              done
+              return 1
+            }
+
+            retry #{attempts} docker exec -i $container ping -w 3 -c 1 #{net_gw} #{should_fail}
+            retry #{attempts} docker exec -i $container ping -w 3 -c 1 8.8.8.8 #{should_fail}
+          "
+        }
+
+      ].join("\n\n")
+
     end
   end
+
 end
