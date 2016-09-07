@@ -125,8 +125,12 @@ Vagrant.configure("2") do |config|
         "
           set -ex
 
-          # allow SVI to arp for our workloads
+          # allow router to arp for our workloads
           echo 1 > /proc/sys/net/ipv4/conf/eth1/proxy_arp
+
+          # also allow vbox eth0 nat interface
+          # this is used for dns as well
+          echo 1 > /proc/sys/net/ipv4/conf/eth0/proxy_arp
 
           # TODO: can't we just use 0.0.0.0 ?
           if [[ $HOSTNAME == calico-02 ]]; then
