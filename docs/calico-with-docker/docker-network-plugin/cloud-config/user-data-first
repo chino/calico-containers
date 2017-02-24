@@ -32,8 +32,8 @@ coreos:
     content: |-
       [Unit]
       Description=Docker Application Container Engine
-      After=docker.socket early-docker.target network.target download-reqs.service
-      Requires=docker.socket early-docker.target download-reqs.service
+      After=docker.socket network.target download-reqs.service
+      Requires=docker.socket download-reqs.service
 
       [Service]
       Environment=TMPDIR=/var/tmp
